@@ -2,7 +2,8 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Memory census of a running build/mkw by zone, every few seconds, until it exits (Linux).
+"""Memory census of a running build/mkw by zone, every few seconds, until it exits (Linux; on Windows memwatch_win.py
+does the census, with the same arguments and files, its columns' meanings in its docstring).
 
 Why: the process's RAM is the game's memory, the runtime's, the GPU driver's and, on an integrated GPU, the GPU's
 memory too; one RSS figure does not say which to cut. The runtime labels its anonymous ranges (plat_mem_name:
@@ -12,7 +13,8 @@ range remapped since it was labelled); above it, the driver's or a library's mma
 run, the game's memory held by NVN pools shows as "pool 0xFLAGS" (NVN memory pool flags) instead of "guest heap".
 
 Usage:
-  uv run tools/run/memwatch.py OUT.tsv [--log build/run/NAME.log] [--every 5]   (start before or with the run)
+  uv run tools/run/memwatch.py OUT.tsv [--log build/run/NAME.log] [--every 5] [--pid PID]   (before or with the run;
+                                       without --pid, the first mkw, or on Windows the mkw.exe holding the game)
   uv run tools/run/memwatch.py --report OUT.tsv                                 (peak and growth per zone)
   --detail "anon unlabelled": also OUT.detail.tsv, the 12 largest mappings of that zone per sample (t, start, size,
   rss, swap MiB, VmFlags and the mapping just below it, which tells whose an unnamed mmap is)
@@ -128,8 +130,8 @@ def phase_of(log: Path | None, state: dict) -> str:
     return state.get("phase", "")
 
 
-def watch(out: Path, log: Path | None, every: float, detail: str | None = None) -> None:
-    while True:
+def watch(out: Path, log: Path | None, every: float, detail: str | None = None, pid: int | None = None) -> None:
+    while pid is None:
         pids = subprocess.run(["pgrep", "-x", "mkw"], capture_output=True, text=True).stdout.split()
         if pids:
             pid = int(pids[0])
@@ -166,20 +168,31 @@ def watch(out: Path, log: Path | None, every: float, detail: str | None = None) 
 
 
 def report(path: Path) -> None:
-    """Per zone: peak RSS (and its phase), the last sample, swap peak; totals of the process at its peak."""
-    rows = [line.split("\t") for line in path.read_text().splitlines()[1:]]
-    per: dict[str, list[tuple[int, str, int, int]]] = defaultdict(list)
+    """Per zone: peak RSS (and its phase), the last sample, swap peak; totals of the process at its peak. A Windows
+    census (memwatch_win.py, first line "# os=win32") counts the peak by resident memory alone: its swap column is
+    memory committed but not resident, most of it no RAM at all, and the commit at that peak is printed beside it."""
+    lines = path.read_text().splitlines()
+    win = bool(lines) and lines[0].startswith("# os=win32")
+    rows = [line.split("\t") for line in lines if not line.startswith("#")][1:]
+    per: dict[str, list[tuple[int, str, int, int, int]]] = defaultdict(list)
     total: dict[int, int] = defaultdict(int)
+    commit: dict[int, int] = defaultdict(int)
     phases: dict[int, str] = {}
-    for t, phase, zone, rss, _pss, _anon, swap in rows:
-        per[zone].append((int(t), phase, int(rss), int(swap)))
+    for t, phase, zone, rss, _pss, anon, swap in rows:
+        per[zone].append((int(t), phase, int(rss), int(swap), int(anon)))
         phases[int(t)] = phase
         if not zone.startswith("="):
-            total[int(t)] += int(rss) + int(swap)
+            total[int(t)] += int(rss) + (0 if win else int(swap))
+            commit[int(t)] += int(anon)
     if not total:
         sys.exit(f"{path}: no samples")
     peak_t = max(total, key=total.get)
-    print(f"process peak (rss+swap) {total[peak_t]} MiB at {peak_t} s ({phases[peak_t]}); last {total[max(total)]} MiB")
+    what = "resident" if win else "rss+swap"
+    print(f"process peak ({what}) {total[peak_t]} MiB at {peak_t} s ({phases[peak_t]}); last {total[max(total)]} MiB")
+    if win:
+        private = next((r[4] for r in per.get("=process", []) if r[0] == peak_t), 0)
+        print(f"committed at that peak {commit[peak_t]} MiB over the zones, images and mapped files included "
+              f"(the process's private commit: {private} MiB)")
     print(f"{'zone':32} {'at peak':>8} {'max':>7} {'last':>7} {'swap':>6}  max at")
     order = sorted(per, key=lambda z: -max(r[2] for r in per[z]))
     for z in order:
@@ -189,7 +202,11 @@ def report(path: Path) -> None:
         if top[2] < 8 and not z.startswith("="):
             continue
         print(f"{z:32} {at_peak:8} {top[2]:7} {s[-1][2]:7} {max(r[3] for r in s):6}  {top[0]} s {top[1]}")
-    print("(=gpu: rss column GTT, pss VRAM; =system: rss MemAvailable, pss GPUReclaim)")
+    if win:
+        print("(swap: committed, not resident; =process: rss working set, swap peak working set; =gpu: rss shared, pss "
+              "dedicated; =system: rss physical available, swap commit limit; =memwatch: rss/pss census ms)")
+    else:
+        print("(=gpu: rss column GTT, pss VRAM; =system: rss MemAvailable, pss GPUReclaim)")
 
 
 def main() -> None:
@@ -199,11 +216,18 @@ def main() -> None:
     ap.add_argument("--every", type=float, default=5)
     ap.add_argument("--report", type=Path)
     ap.add_argument("--detail", help='a zone whose largest mappings go to OUT.detail.tsv, e.g. "anon unlabelled"')
+    ap.add_argument("--pid", type=int, help="the process to watch")
     a = ap.parse_args()
+    if a.every <= 0:
+        ap.error("--every must be a positive number of seconds")
     if a.report:
         report(a.report)
+    elif a.out and sys.platform == "win32":
+        import memwatch_win
+
+        memwatch_win.watch(a.out, a.log, a.every, a.detail, a.pid, phase_of)
     elif a.out:
-        watch(a.out, a.log, a.every, a.detail)
+        watch(a.out, a.log, a.every, a.detail, a.pid)
     else:
         ap.error("OUT.tsv or --report")
 
