@@ -2,7 +2,8 @@
 and the log's lines (the heap, the runtime's own regions, the modules), only the runtime's reservations taken as the
 guest's, private memory by what is known of it (stack, heap, guard pages, write-combined, size), images by file, the
 game's process told from plat_reexec's parent, and memwatch.py's report of a Windows file (resident peaks, commit-only
-zones, samples a tenth of a second apart). On Windows: a census of a child process that commits 64 MiB and touches 16
+zones, samples a tenth of a second apart). On Windows: an allocation made between the two queries of the address
+space asked for again whole (with fakes of both); a census of a child process that commits 64 MiB and touches 16
 MiB of it, creates a heap and grows it, and allocates large blocks from both heaps: the allocation committed and
 resident as made, the heaps' segments and large blocks under "malloc" and "heap N", its thread's stack, the zones
 against the process's private commit, a committed page never touched left out of RAM (the census reads nothing of
@@ -13,6 +14,7 @@ Usage: uv run pytest tests
 """
 
 import contextlib
+import ctypes as C
 import io
 import json
 import re
@@ -157,6 +159,41 @@ def test_report_of_a_linux_census_unchanged(tmp_path: Path) -> None:
                      "5\trace\tguest heap\t3500\t3400\t3500\t200\n", tmp_path)
     assert "process peak (rss+swap) 3700 MiB at 5 s (race)" in text
     assert re.search(r"^guest heap\s+3700\s+3500\s+3500\s+200\s+5 s race", text, re.M)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows' structures")
+@pytest.mark.parametrize("refused_again", [False, True])
+def test_an_allocation_made_between_the_two_queries(monkeypatch, capsys, refused_again: bool) -> None:
+    """MemoryRegionInformation finds an address free, VirtualQueryEx then finds a view mapped there (the game maps and
+    unmaps small views all the time): it is asked for again whole, with no warning; one it still refuses is walked
+    region by region, with a warning, to the same numbers."""
+    BASE, SIZE, INVALID = 0x10000, 0x39000, 0xC0000141
+    asked = []
+
+    def region_information(h, addr, cls, out, size, ret):
+        asked.append(addr)
+        if addr != BASE or len(asked) == 1 or refused_again:
+            return INVALID
+        r = out._obj
+        r.AllocationBase, r.AllocationProtect, r.RegionType = BASE, 0x04, mw.MEM_MAPPED
+        r.RegionSize = r.CommitSize = SIZE
+        return 0
+
+    def basic_information(h, addr, out, size):
+        if addr >= BASE + SIZE:  # past the top of the address space
+            C.set_last_error(87)
+            return 0
+        m = out._obj
+        m.BaseAddress = m.AllocationBase = BASE
+        m.RegionSize, m.State, m.Protect, m.AllocationProtect, m.Type = SIZE, mw.MEM_COMMIT, 0x04, 0x04, mw.MEM_MAPPED
+        return size
+
+    monkeypatch.setattr(mw.ntdll, "NtQueryVirtualMemory", region_information)
+    monkeypatch.setattr(mw.k32, "VirtualQueryEx", basic_information)
+    assert mw.allocations(0, mw.Timer()) == [(BASE, SIZE, SIZE, 0x04, mw.MEM_MAPPED)]
+    assert asked[:2] == [BASE, BASE]
+    warned = capsys.readouterr().err
+    assert ("walked region by region" in warned) == refused_again, warned
 
 
 CHILD = r"""

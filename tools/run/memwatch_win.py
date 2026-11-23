@@ -9,7 +9,8 @@ Why: memwatch.py reads /proc/PID/smaps, which Windows has no counterpart of, and
 so nothing told which part of a Windows run's RAM and commit charge was the game's, malloc's or the GPU driver's. A
 1.8.0 Grand Prix on an RTX 3080 Ti (22/11/2026) had a 9.0 GB working set and 18.9 GB of private commit: 7.9 GB of it
 write-combined mappings of VRAM (Resizable BAR) that took no RAM, and 2.6 GB in four 1 GiB reservations no runtime call
-makes.
+makes: the Vulkan driver's, which held 1.8 GB less at the title screen without the boot's pipeline prewarm
+(MKW_PIPE_PREBUILD=0, 23/11/2026).
 
 How, without disturbing the game: the process is opened with query and read rights only (never suspended, debugged or
 written to), at below-normal priority, and only memory the census needs is read: the PEB, the TEBs and the heaps' own
@@ -19,7 +20,10 @@ regions (VirtualQueryEx) would give each region's commit, but one call scans the
 protection while it holds that allocation: the game's commits, VirtualProtect and GetWriteWatch inside it wait as long
 (22/11/2026, Windows 10 22H2: 13.8 ms per GiB, 55 ms over a 4 GiB run; MemoryRegionInformation 0.02 ms and no wait).
 So regions are walked only in allocations with at most 16 MiB committed (stacks, to find their guard pages), or
-everywhere with --regions. The "=memwatch" row says what the census cost.
+everywhere with --regions. QueryWorkingSet holds nothing the game waits on: with 6 GiB resident one call took 158 ms
+while the target's demand-zero faults and VirtualProtect took at most 0.46 ms, as idle (23/11/2026; QueryWorkingSetEx,
+which would read only the pages asked for, made the target's VirtualProtect wait as long as each call, 6.6 ms per
+64 Ki pages, so it is not used). The "=memwatch" row says what the census cost.
 
 Zones: the guest's from the layout of runtime/core/memory/memory.c (the 14 GiB stack and heap block, the 64 GiB alias)
 and host.h (RT_KERNEL_BASE, RT_HOSTFN_BASE), refined by the log's "loaded NAME at", "mem: heap" and "bytes of the
@@ -40,8 +44,10 @@ store, still RAM, or to the page file), or not RAM at all (VRAM the driver maps 
 locks, which the working set does not list). Rows "=process": working set, private working set, private commit
 (PrivateUsage), peak working set; "=system": physical memory available, 0, commit total, commit limit; "=gpu": the
 process's shared (system RAM) and dedicated (VRAM) GPU memory and its GPU commit (GPU Process Memory counters), as
-Linux's GTT and VRAM; "=memwatch": ms the allocations took, ms the working set took, ms of the longest single call
-(what the game may have waited), 0.
+Linux's GTT and VRAM; "=memwatch": ms the allocations took, ms the working set took (its call and the sorting here,
+memwatch's own time: 0.6-0.9 s with the game's 7-9 GB resident), ms of the longest single call into the game's
+address space (what the game may have waited; at the boot, while the driver allocates, also what memwatch waited on
+it: 8 ms once, 2.7 s in, 23/11/2026; then 2 ms at most), 0.
 
 Usage: uv run tools/run/memwatch.py OUT.tsv [--log LOG] [--pid PID] [--every 5] [--regions]   (it comes here)
        uv run tools/run/memwatch_win.py PID [--regions]                                       (one census, printed)
@@ -401,10 +407,18 @@ def allocations(h: int, timer: Timer) -> list[tuple[int, int, int, int, int]]:
         if m.State == MEM_FREE:
             addr = m.BaseAddress + m.RegionSize
             continue
-        # An allocated address MemoryRegionInformation refused (STATUS_INVALID_ADDRESS only means free space): this
-        # one allocation is measured region by region, at that walk's cost
-        warn(f"MemoryRegionInformation refused {addr:#x} (status {st:#x}): such allocations are walked region by "
-             "region")
+        # Free when MemoryRegionInformation was asked, allocated when VirtualQueryEx was: mkw.exe maps and unmaps small
+        # views all the time (23/11/2026, a 54 s run: four, 228 KiB MEM_MAPPED views, two of them unmapped again by the
+        # next query). The new allocation is asked again whole; only one still refused is walked region by region
+        if m.AllocationBase >= addr:
+            st2 = timer(ntdll.NtQueryVirtualMemory, h, m.AllocationBase, 3, C.byref(r), C.sizeof(r), None)
+            if st2 == 0:
+                t = MEM_MAPPED if r.RegionType == MEM_PAGEFILE_SECTION else r.RegionType
+                out.append((r.AllocationBase, r.RegionSize, r.CommitSize, r.AllocationProtect, t))
+                addr = r.AllocationBase + r.RegionSize
+                continue
+        warn(f"MemoryRegionInformation refused {addr:#x} (status {st:#x}) and the allocation VirtualQueryEx found "
+             f"there ({m.AllocationBase:#x}, type {m.Type:#x}): it is walked region by region")
         ab, typ, reserved, committed, prot = m.AllocationBase, m.Type, 0, 0, m.AllocationProtect
         while m.AllocationBase == ab and m.State != MEM_FREE:
             reserved += m.RegionSize
@@ -646,10 +660,8 @@ def census(h: int, pid: int, guest: GuestMap, every_region: bool = False):
     block = guest_block(allocs)
     edges = guest.edges(block)
     heaps = heap_list(h)
-    if heaps is None:
-        if exited(h):
-            raise OSError("the process exited")
-        warn("the PEB's heap list cannot be read: no malloc and heap zones")
+    if heaps is None and exited(h):
+        raise OSError("the process exited")
     owners = heap_owners(h, heaps, alloc_of) if heaps else {}
     stacks = stack_bases(h, pid)
     zones: dict[str, list[int]] = defaultdict(lambda: [0, 0, 0, 0])
@@ -706,6 +718,10 @@ def census(h: int, pid: int, guest: GuestMap, every_region: bool = False):
         per[base] = (z, reserved, committed, res, prot)
     if exited(h):
         raise OSError("the process exited")
+    # Said only of a census that is written: a process that is ending loses its heaps before it is signalled (23/11/2026,
+    # a run's last census warned this and was then dropped as the process exited)
+    if heaps is None:
+        warn("the PEB's heap list cannot be read: no malloc and heap zones")
     return zones, per, (round((t1 - t0) * 1000), round((t2 - t1) * 1000), round(timer.worst, 1))
 
 
