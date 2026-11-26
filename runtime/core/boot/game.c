@@ -139,14 +139,18 @@ static int auto_interval(uint64_t obj) {
     static FpsAuto a;
     static int ready;
     static uint64_t last;   // when the last frame began: the real period, which the game's measure can fall short of
+    static uint64_t last_ticks;   // the game clock then: the game time the last frame advanced (its present's interval)
     int n = frame_logic_hz();   // its ticks: back to 60 in time trial starts it over
     if (!ready || a.hz != n) fps_auto_reset(&a), a.hz = n, ready = 1;
-    uint64_t now = kern_now_ns();
+    uint64_t now = kern_now_ns(), t = frame_step_ticks();
     double ms = (double)*(const int64_t *)(uintptr_t)(obj + FRAME_MEASURED) * RT_TICK_NS / 1e6;
-    double real = last ? (now - last) / 1e6 / turbo_speed() : 0;
-    last = now;
-    int prev = a.iv, iv = fps_auto_step(&a, ms, real);
-    if (iv != prev) rt_log("game: auto interval %d -> %d (frame %.1f ms, real %.1f ms)", prev, iv, ms, real);
+    double real = last ? (now - last) / 1e6 / turbo_speed() : 0, game = last ? (t - last_ticks) * 1000.0 / 60 : 0;
+    last = now, last_ticks = t;
+    double lost = a.lost;   // game time lost up to the frame before (fps_auto.c): what an up answers
+    int prev = a.iv, iv = fps_auto_step(&a, ms, real, game);
+    if (iv != prev)
+        rt_log("game: auto interval %d -> %d (frame %.1f ms, real %.1f ms, game time lost %.0f ms)", prev, iv, ms, real,
+               lost);
     return iv;
 }
 

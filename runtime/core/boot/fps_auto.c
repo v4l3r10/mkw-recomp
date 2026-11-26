@@ -39,6 +39,15 @@
 #define TRIAL_FIRST_S 10
 #define TRIAL_MAX_S 60
 #define TRIAL_S 1.0   // the clock follows the load within tens of ms; the verdict is on its last 8 frames
+// Game time. A faster interval is kept while the game runs at full speed: fa886-169-60-1 (26/11/2026, Windows, 16:9
+// at MKW_FPS=60, a 4-race Grand Prix with MKW_FRAME_TRACE) went up on bursts of 18-25 ms frames that the pacer catches
+// up (nvn_api_obj.c pace(): a frame late by under a period keeps its slot chain), so auto would have run at 30 for 30 %
+// of a race whose game time ran at 1.0000x at 60; the race that 60 did not hold ran at 0.970x, its frames mostly
+// fitting 60 and a few a whole period late. So an up needs game time lost (the frames' real time past the game time
+// they advanced, decayed over LOSS_TAU_S) past LOSS_SHARE of it, and that alone moves up one step, counting only the
+// frames a stall does not explain (a hitch of 200 ms frames loses time no interval keeps).
+#define LOSS_TAU_S 2.0
+#define LOSS_SHARE 0.02
 
 static double median(const FpsAuto *a, unsigned count) {
     double v[FPS_AUTO_HIST];
@@ -72,6 +81,23 @@ void fps_auto_reset(FpsAuto *a) {
 
 static unsigned frames_of(const FpsAuto *a, double s, int iv) { return (unsigned)(s * rate(a) / iv); }
 
+// The frame's game time lost into both sums (none below zero: a frame the pacer caught up only pays back the one
+// before it), and whether each is past LOSS_SHARE of its window
+static void lose(FpsAuto *a, double real_ms, double game_ms) {
+    if (real_ms <= 0) return;   // the first frame: no period yet
+    if (game_ms <= 0) game_ms = a->iv * period_ms(a);
+    double k = real_ms / (LOSS_TAU_S * 1000.0), keep = k < 1 ? 1 - k : 0, lost = real_ms - game_ms;
+    a->lost = a->lost * keep + lost;
+    a->lost_held *= keep;
+    if (real_ms <= max_iv(a) * period_ms(a) * STALL_FACTOR) a->lost_held += lost;
+    if (a->lost < 0) a->lost = 0;
+    if (a->lost_held < 0) a->lost_held = 0;
+}
+
+static int losing(double lost) { return lost > LOSS_SHARE * LOSS_TAU_S * 1000.0; }
+
+static void moved(FpsAuto *a) { a->lost = a->lost_held = 0; }   // a new interval: its own game time from here
+
 // The frame's part of a trial: 1 while one is under way (the rules that move the interval wait for its end).
 static int trial_step(FpsAuto *a, double v) {
     int slow = 2 * rate(a) / 60;   // 30 fps in ticks: trials only below it
@@ -85,6 +111,7 @@ static int trial_step(FpsAuto *a, double v) {
             a->trial_s = a->trial_s * 2 > TRIAL_MAX_S ? TRIAL_MAX_S : a->trial_s * 2;
         }
         a->since = 0, a->downed = 0, a->hold = 0;
+        moved(a);
         a->trial_wait = frames_of(a, a->trial_s, a->iv);
         return 1;
     }
@@ -95,6 +122,7 @@ static int trial_step(FpsAuto *a, double v) {
     if (!a->trial_wait) a->trial_wait = frames_of(a, a->trial_s, a->iv);
     if (--a->trial_wait) return 0;
     a->trial_from = a->iv--, a->since = 0, a->downed = 0;
+    moved(a);
     a->trial = frames_of(a, TRIAL_S, a->iv);
     return 1;
 }
@@ -110,11 +138,13 @@ static double median_real(const FpsAuto *a) {   // the last UP_FRAMES real perio
     return v[UP_FRAMES / 2];
 }
 
-// measured_ms: the game's own measure of the frame; real_ms: the time since the last frame began (0 unknown). Up on
-// the larger of the two: the game's measure can stay under the real period (lat5: 3 -> 1 on 8.7 ms frames before the
-// start, then the race at 0.79x at interval 1). Down one step at a time; after an up, no down for hold_s seconds,
-// doubled (to 60) when the up undid a down of the last 10 s.
-int fps_auto_step(FpsAuto *a, double measured_ms, double real_ms) {
+// measured_ms: the game's own measure of the frame; real_ms: the time since the last frame began (0 unknown); game_ms:
+// the game time it advanced (0: its interval's). Up on the larger of the first two, once game time is lost: the game's
+// measure can stay under the real period (lat5: 3 -> 1 on 8.7 ms frames before the start, then the race at 0.79x at
+// interval 1). Down one step at a time; after an up, no down for hold_s seconds, doubled (to 60) when the up undid a
+// down of the last 10 s.
+int fps_auto_step(FpsAuto *a, double measured_ms, double real_ms, double game_ms) {
+    lose(a, real_ms, game_ms);   // at the interval the frame ran at, before anything moves it
     a->hist[a->head] = measured_ms;
     a->head = (a->head + 1) % FPS_AUTO_HIST;
     a->real[a->n_real++ % UP_FRAMES] = real_ms;
@@ -135,11 +165,14 @@ int fps_auto_step(FpsAuto *a, double measured_ms, double real_ms) {
         a->stall_ms = stalled ? a->stall_ms + (real_ms > measured_ms ? real_ms : measured_ms) : 0;
         int up = stalled && a->stall_ms < STALL_MAX_S * 1000.0 ? a->iv : fitting(a, v, UP_MARGIN);
         if (!stalled) a->fits = up <= a->iv;
-        if (up > a->iv) {
+        // frames that fit, a few a whole period late (fa886-169-60-1's slowest race): one step
+        if (!stalled && up <= a->iv && a->iv < max_iv(a) && losing(a->lost_held)) up = a->iv + 1;
+        if (up > a->iv && losing(a->lost)) {
             int undid_down = a->downed && a->since < (unsigned)(PINGPONG_S * rate(a) / a->iv);
             a->hold_s = undid_down ? (a->hold_s * 2 > HOLD_MAX_S ? HOLD_MAX_S : a->hold_s * 2) : HOLD_MIN_S;
             a->iv = up, a->since = 0, a->downed = 0, a->trial_wait = 0;
             a->hold = (unsigned)(a->hold_s * rate(a) / a->iv);
+            moved(a);
             return a->iv;
         }
     }
@@ -147,7 +180,7 @@ int fps_auto_step(FpsAuto *a, double measured_ms, double real_ms) {
     if (a->iv > 1 && !a->hold && a->since >= window && a->n >= window) {
         // one step at a time: the game's measure can be far under the frame's real cost (lat6: 9 ms at interval 4,
         // 66 ms frames), so a step down is a trial the real period confirms or undoes within 8 frames
-        if (fitting(a, median(a, window), DOWN_MARGIN) < a->iv) a->iv--, a->since = 0, a->downed = 1;
+        if (fitting(a, median(a, window), DOWN_MARGIN) < a->iv) a->iv--, a->since = 0, a->downed = 1, moved(a);
     }
     return a->iv;
 }

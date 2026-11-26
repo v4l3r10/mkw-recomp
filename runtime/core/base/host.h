@@ -363,10 +363,13 @@ typedef struct {
     unsigned held, trial, trial_wait;
     int trial_from;
     double trial_s;
+    // game time the frames lost (real time past it), decayed over about two seconds: all frames, and those a stall
+    // does not explain (fps_auto.c)
+    double lost, lost_held;
 } FpsAuto;
-void fps_auto_reset(FpsAuto *a);                           // interval 1, no history
-int fps_auto_step(FpsAuto *a, double measured_ms, double real_ms);   // a frame's game measure and real period in,
-                                                                     // the interval to use out
+void fps_auto_reset(FpsAuto *a);   // interval 1, no history
+// A frame's game measure, real period and game time (0: its interval's) in, the interval to use out
+int fps_auto_step(FpsAuto *a, double measured_ms, double real_ms, double game_ms);
 int probe_discord(void);                                   // discord_probe.c: Rich Presence against the local Discord
 int probe_dsu(void);                                       // dsu_probe.c: the DSU motion client against a fake server
 int probe_pads(void);                                      // pads_probe.c: players and their gamepads, traded (virtual gamepads)
